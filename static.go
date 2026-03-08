@@ -4,45 +4,57 @@ import (
 	"github.com/miekg/dns"
 )
 
-// StaticTemplateResolver is a resolver that always returns a predefined set of records
-// which can be customized with information from the question. It is similar to
-// StaticResolver but allows the use of templates with placeholders as input.
-type StaticTemplateResolver struct {
+// StaticResolver is a resolver that always returns the same answer, to any question.
+// Typically used in combination with a blocklist to define fixed block responses or
+// with a router when building a walled garden.
+type StaticResolver struct {
 	id       string
-	answer   []*Template
-	ns       []*Template
-	extra    []*Template
+	answer   []dns.RR
+	ns       []dns.RR
+	extra    []dns.RR
 	rcode    int
 	truncate bool
 	opt      StaticResolverOptions
 }
 
-var _ Resolver = &StaticTemplateResolver{}
+var _ Resolver = &StaticResolver{}
 
-// NewStaticTemplateResolver returns a new instance of a StaticTemplateResolver resolver.
-func NewStaticTemplateResolver(id string, opt StaticResolverOptions) (*StaticTemplateResolver, error) {
-	r := &StaticTemplateResolver{id: id, opt: opt}
+type StaticResolverOptions struct {
+	// Records in zone-file format
+	Answer   []string
+	NS       []string
+	Extra    []string
+	RCode    int
+	Truncate bool
+	// Optional, allows specifying extended errors to be used in the
+	// response when blocking.
+	EDNS0EDETemplate *EDNS0EDETemplate
+}
+
+// NewStaticResolver returns a new instance of a StaticResolver resolver.
+func NewStaticResolver(id string, opt StaticResolverOptions) (*StaticResolver, error) {
+	r := &StaticResolver{id: id, opt: opt}
 
 	for _, record := range opt.Answer {
-		tpl, err := NewTemplate(record)
+		rr, err := dns.NewRR(record)
 		if err != nil {
 			return nil, err
 		}
-		r.answer = append(r.answer, tpl)
+		r.answer = append(r.answer, rr)
 	}
 	for _, record := range opt.NS {
-		tpl, err := NewTemplate(record)
+		rr, err := dns.NewRR(record)
 		if err != nil {
 			return nil, err
 		}
-		r.ns = append(r.ns, tpl)
+		r.ns = append(r.ns, rr)
 	}
 	for _, record := range opt.Extra {
-		tpl, err := NewTemplate(record)
+		rr, err := dns.NewRR(record)
 		if err != nil {
 			return nil, err
 		}
-		r.extra = append(r.extra, tpl)
+		r.extra = append(r.extra, rr)
 	}
 	r.rcode = opt.RCode
 	r.truncate = opt.Truncate
@@ -50,17 +62,23 @@ func NewStaticTemplateResolver(id string, opt StaticResolverOptions) (*StaticTem
 	return r, nil
 }
 
-// Resolve a DNS query by incorporating data from the query into a fixed response.
-func (r *StaticTemplateResolver) Resolve(q *dns.Msg, ci ClientInfo) (*dns.Msg, error) {
+// Resolve a DNS query by returning a fixed response.
+func (r *StaticResolver) Resolve(q *dns.Msg, ci ClientInfo) (*dns.Msg, error) {
 	answer := new(dns.Msg)
 	answer.SetReply(q)
 	answer.RecursionAvailable = true // we support recursion (even if we didn't actually do any)
 	answer.Authoritative = true      // we made that reply up
 	log := logger(r.id, q, ci)
 
-	answer.Answer = r.processRRTemplates(q, ci, r.answer...)
-	answer.Ns = r.processRRTemplates(q, ci, r.ns...)
-	answer.Extra = r.processRRTemplates(q, ci, r.extra...)
+	// Update the name of every answer record to match that of the query
+	answer.Answer = make([]dns.RR, 0, len(r.answer))
+	for _, rr := range r.answer {
+		r := dns.Copy(rr)
+		r.Header().Name = qName(q)
+		answer.Answer = append(answer.Answer, r)
+	}
+	answer.Ns = r.ns
+	answer.Extra = r.extra
 	answer.Rcode = r.rcode
 	answer.Truncated = r.truncate
 
@@ -73,39 +91,6 @@ func (r *StaticTemplateResolver) Resolve(q *dns.Msg, ci ClientInfo) (*dns.Msg, e
 	return answer, nil
 }
 
-func (r *StaticTemplateResolver) String() string {
+func (r *StaticResolver) String() string {
 	return r.id
-}
-
-func (r *StaticTemplateResolver) processRRTemplates(q *dns.Msg, ci ClientInfo, templates ...*Template) []dns.RR {
-	log := logger(r.id, q, ci)
-
-	resp := make([]dns.RR, 0, len(templates))
-	var question dns.Question
-	if len(q.Question) > 0 {
-		question = q.Question[0]
-	}
-	input := templateInput{
-		ID:            q.Id,
-		Question:      question.Name,
-		QuestionClass: dns.ClassToString[question.Qclass],
-		QuestionType:  dns.TypeToString[question.Qtype],
-	}
-	for _, tpl := range templates {
-		text, err := tpl.Apply(input)
-		if err != nil {
-			log.Warn("failed to apply template", "error", err)
-			continue
-		}
-
-		rr, err := dns.NewRR(text)
-		if err != nil {
-			log.Warn("failed to parse template output", "error", err)
-			continue
-		}
-		// Update the name of every answer record to match that of the query
-		// rr.Header().Name = qName(q)
-		resp = append(resp, rr)
-	}
-	return resp
 }
