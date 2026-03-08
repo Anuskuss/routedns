@@ -1,47 +1,32 @@
 package rdns
 
 import (
-	"fmt"
-	"net"
+	"strings"
 	"sync"
 	"time"
-
-	"log/slog"
 
 	"github.com/miekg/dns"
 )
 
-// IPBlocklistDB is a database containing IPs used in blocklists.
-type IPBlocklistDB interface {
-	Reload() (IPBlocklistDB, error)
-	Match(ip net.IP) (*BlocklistMatch, bool)
-	Close() error
-	fmt.Stringer
-}
-
-// ResponseBlocklistIP is a resolver that filters by matching the IPs in the response against
-// a blocklist.
-type ResponseBlocklistIP struct {
+// ResponseBlocklistName is a resolver that filters by matching the strings in CNAME, MX,
+// NS, PTR and SRV response records against a blocklist.
+type ResponseBlocklistName struct {
 	id string
-	ResponseBlocklistIPOptions
+	ResponseBlocklistNameOptions
 	resolver Resolver
 	mu       sync.RWMutex
 }
 
-var _ Resolver = &ResponseBlocklistIP{}
+var _ Resolver = &ResponseBlocklistName{}
 
-type ResponseBlocklistIPOptions struct {
+type ResponseBlocklistNameOptions struct {
 	// Optional, if the response is found to match the blocklist, send the query to this resolver.
 	BlocklistResolver Resolver
 
-	BlocklistDB IPBlocklistDB
+	BlocklistDB BlocklistDB
 
 	// Refresh period for the blocklist. Disabled if 0.
 	BlocklistRefresh time.Duration
-
-	// If true, removes matching records from the response rather than replying with NXDOMAIN. Can
-	// not be combined with alternative blocklist-resolver
-	Filter bool
 
 	// Inverted behavior, only allow responses that can be found on at least one list.
 	Inverted bool
@@ -51,9 +36,9 @@ type ResponseBlocklistIPOptions struct {
 	EDNS0EDETemplate *EDNS0EDETemplate
 }
 
-// NewResponseBlocklistIP returns a new instance of a response blocklist resolver.
-func NewResponseBlocklistIP(id string, resolver Resolver, opt ResponseBlocklistIPOptions) (*ResponseBlocklistIP, error) {
-	blocklist := &ResponseBlocklistIP{id: id, resolver: resolver, ResponseBlocklistIPOptions: opt}
+// NewResponseBlocklistName returns a new instance of a response blocklist resolver.
+func NewResponseBlocklistName(id string, resolver Resolver, opt ResponseBlocklistNameOptions) (*ResponseBlocklistName, error) {
+	blocklist := &ResponseBlocklistName{id: id, resolver: resolver, ResponseBlocklistNameOptions: opt}
 
 	// Start the refresh goroutines if we have a list and a refresh period was given
 	if blocklist.BlocklistDB != nil && blocklist.BlocklistRefresh > 0 {
@@ -62,70 +47,74 @@ func NewResponseBlocklistIP(id string, resolver Resolver, opt ResponseBlocklistI
 	return blocklist, nil
 }
 
-// Resolve a DNS query by first querying the upstream resolver, then checking any IP responses
-// against a blocklist. Responds with NXDOMAIN if the response IP is in the filter-list.
-func (r *ResponseBlocklistIP) Resolve(q *dns.Msg, ci ClientInfo) (*dns.Msg, error) {
+// Resolve a DNS query by first querying the upstream resolver, then checking any responses with
+// strings against a blocklist. Responds with NXDOMAIN if the response matches the filter.
+func (r *ResponseBlocklistName) Resolve(q *dns.Msg, ci ClientInfo) (*dns.Msg, error) {
 	answer, err := r.resolver.Resolve(q, ci)
 	if err != nil || answer == nil {
 		return answer, err
 	}
-	if answer.Rcode != dns.RcodeSuccess {
-		return answer, err
-	}
-	if r.Filter {
-		return r.filterMatch(q, answer, ci)
-	}
 	return r.blockIfMatch(q, answer, ci)
 }
 
-func (r *ResponseBlocklistIP) String() string {
+func (r *ResponseBlocklistName) String() string {
 	return r.id
 }
 
-func (r *ResponseBlocklistIP) refreshLoopBlocklist(refresh time.Duration) {
+func (r *ResponseBlocklistName) refreshLoopBlocklist(refresh time.Duration) {
 	for {
 		time.Sleep(refresh)
 		log := Log.With("id", r.id)
 		log.Debug("reloading blocklist")
 		db, err := r.BlocklistDB.Reload()
 		if err != nil {
-			log.Error("failed to load rules",
-				"error", err)
+			log.Error("failed to load rules", "error", err)
 			continue
 		}
 		r.mu.Lock()
-		r.BlocklistDB.Close()
 		r.BlocklistDB = db
 		r.mu.Unlock()
 	}
 }
 
-func (r *ResponseBlocklistIP) blockIfMatch(query, answer *dns.Msg, ci ClientInfo) (*dns.Msg, error) {
+func (r *ResponseBlocklistName) blockIfMatch(query, answer *dns.Msg, ci ClientInfo) (*dns.Msg, error) {
 	for _, records := range [][]dns.RR{answer.Answer, answer.Ns, answer.Extra} {
 		for _, rr := range records {
-			var ip net.IP
+			var name string
 			switch r := rr.(type) {
-			case *dns.A:
-				ip = r.A
-			case *dns.AAAA:
-				ip = r.AAAA
+			case *dns.CNAME:
+				name = r.Target
+			case *dns.MX:
+				name = r.Mx
+			case *dns.NS:
+				name = r.Ns
+			case *dns.PTR:
+				name = r.Ptr
+			case *dns.SRV:
+				name = r.Target
+			case *dns.HTTPS:
+				name = svcbString(&r.SVCB)
+			case *dns.TXT:
+				name = strings.Join(r.Txt, " ")
+			case *dns.SVCB:
+				name = svcbString(r)
+			case *dns.SOA:
+				name = r.Ns
 			default:
 				continue
 			}
-			if match, ok := r.BlocklistDB.Match(ip); ok != r.Inverted {
-				log := logger(r.id, query, ci).With(
-					slog.String("list", match.GetList()),
-					slog.String("rule", match.GetRule()),
-					slog.String("ip", ip.String()),
-				)
+			msg := new(dns.Msg)
+			msg.SetQuestion(name, 0)
+			if _, _, rule, ok := r.BlocklistDB.Match(msg); ok != r.Inverted {
+				log := logger(r.id, query, ci).With("rule", rule.GetRule())
 				if r.BlocklistResolver != nil {
-					log.With(slog.String("resolver", r.BlocklistResolver.String())).Debug("blocklist match, forwarding to blocklist-resolver")
+					log.Debug("blocklist match, forwarding to blocklist-resolver", "resolver", r.BlocklistResolver)
 					return r.BlocklistResolver.Resolve(query, ci)
 				}
 				log.Debug("blocking response")
 				answer = nxdomain(query)
 				answer.RecursionAvailable = true // we support recursion (even if we didn't actually do any)
-				if err := r.EDNS0EDETemplate.Apply(answer, EDNS0EDEInput{query, match}); err != nil {
+				if err := r.EDNS0EDETemplate.Apply(answer, EDNS0EDEInput{query, rule}); err != nil {
 					log.Warn("failed to apply edns0ede template", "error", err)
 				}
 				return answer, nil
@@ -135,48 +124,16 @@ func (r *ResponseBlocklistIP) blockIfMatch(query, answer *dns.Msg, ci ClientInfo
 	return answer, nil
 }
 
-func (r *ResponseBlocklistIP) filterMatch(query, answer *dns.Msg, ci ClientInfo) (*dns.Msg, error) {
-	answer.Answer = r.filterRR(query, ci, answer.Answer)
-	// If there's nothing left after applying the filter, return NXDOMAIN or send to the alternative resolver
-	if len(answer.Answer) == 0 {
-		log := Log.With("qname", qName(query))
-		if r.BlocklistResolver != nil {
-			log.With(slog.String("resolver", r.BlocklistResolver.String())).Debug("no answers after filtering, forwarding to blocklist-resolver")
-			return r.BlocklistResolver.Resolve(query, ci)
-		}
-		log.Debug("no answers after filtering, blocking response")
-		answer = nxdomain(query)
-		answer.RecursionAvailable = true // we support recursion (even if we didn't actually do any)
-		return answer, nil
+// Format an SVCB (and HTTPS) record as string like so "TARGET key1=value1 key2=value2"
+// For example: ". alpn=h2,h3"
+func svcbString(rr *dns.SVCB) string {
+	var s strings.Builder
+	s.WriteString(rr.Target)
+	for _, v := range rr.Value {
+		s.WriteString(" ")
+		s.WriteString(v.Key().String())
+		s.WriteString("=")
+		s.WriteString(v.String())
 	}
-	answer.Ns = r.filterRR(query, ci, answer.Ns)
-	answer.Extra = r.filterRR(query, ci, answer.Extra)
-	return answer, nil
-}
-
-func (r *ResponseBlocklistIP) filterRR(query *dns.Msg, ci ClientInfo, rrs []dns.RR) []dns.RR {
-	newRRs := make([]dns.RR, 0, len(rrs))
-	for _, rr := range rrs {
-		var ip net.IP
-		switch r := rr.(type) {
-		case *dns.A:
-			ip = r.A
-		case *dns.AAAA:
-			ip = r.AAAA
-		default:
-			newRRs = append(newRRs, rr)
-			continue
-		}
-		if match, ok := r.BlocklistDB.Match(ip); ok != r.Inverted {
-			log := logger(r.id, query, ci).With(
-				slog.String("list", match.GetList()),
-				slog.String("rule", match.GetRule()),
-				slog.String("ip", ip.String()),
-			)
-			log.Debug("filtering response")
-			continue
-		}
-		newRRs = append(newRRs, rr)
-	}
-	return newRRs
+	return s.String()
 }
