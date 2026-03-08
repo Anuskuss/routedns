@@ -144,8 +144,7 @@ func (r *ResponseBlocklistIP) filterMatch(query, answer *dns.Msg, ci ClientInfo)
 			return r.BlocklistResolver.Resolve(query, ci)
 		}
 		log.Debug("no answers after filtering, blocking response")
-		answer = nxdomain(query)
-		return answer, nil
+		return nxdomain(query), nil
 	}
 	answer.Ns = r.filterRR(query, ci, answer.Ns)
 	answer.Extra = r.filterRR(query, ci, answer.Extra)
